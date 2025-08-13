@@ -1,52 +1,63 @@
 // /tts-engine.js
-// TTS komplett im Browser ohne Preset-Files mit eSpeak NG (WASM) + Gong-Erzeugung via WebAudio.
-// Du musst die eSpeak-WASM-Bundles in /tts/ hosten (siehe README unten).
+// FIX: Kein dynamic import mehr (der brach auf GitHub Pages).
+// Wir laden espeak.js klassisch via <script>-Injection und initialisieren dann.
+// Stelle sicher, dass in /tts die vier Dateien liegen: espeak.js, espeak.wasm, espeak.worker.js, espeak.data
 
 export class TtsEngine {
   constructor({sampleRate=44100, voice='de', rate=160, pitch=50}={}){
-    this.sampleRate = sampleRate;         // // Ziel-Samplerate
-    this.voice = voice;                   // // z.B. 'de'
-    this.rate = rate;                     // // 80..450 (eSpeak Skala)
-    this.pitch = pitch;                   // // 0..99
-    this._mod = null;                     // // eSpeak Modul
-    this._ctx = new (window.AudioContext || window.webkitAudioContext)(); // // zum Dekodieren
+    this.sampleRate = sampleRate;               // Ziel-Samplerate
+    this.voice = voice;                         // z.B. 'de'
+    this.rate = rate;                           // 80..450 (eSpeak Skala)
+    this.pitch = pitch;                         // 0..99
+    this._mod = null;                           // espeak Modul (window.espeak)
+    this._ctx = new (window.AudioContext || window.webkitAudioContext)();
+    this._loaded = false;                       // wurde espeak initialisiert?
+  }
+
+  // Hilfsfunktion: Script-Datei laden (klassisch, kein ES-Module nötig)
+  _loadScript(src){
+    return new Promise((resolve, reject)=>{
+      const s = document.createElement('script');
+      s.src = src;
+      s.async = true;
+      s.onload = ()=>resolve();
+      s.onerror = ()=>reject(new Error('Script nicht ladbar: '+src));
+      document.head.appendChild(s);
+    });
   }
 
   // eSpeak-WASM laden (einmalig)
   async load(){
-    if (this._mod) return;
-    // eSpeak Initialisierung (der folgende Loader setzt voraus, dass du die eSpeak-Dateien hostest)
-    // Erwartete Dateien in /tts/:
-    //   - espeak.wasm
-    //   - espeak.worker.js
-    //   - espeak.data (Stimmen-Daten)
-    //   - espeak.js (Loader)
-    // HINWEIS: Dateinamen ggf. an deinen Build anpassen.
-    await this._ensureEspeakLoaded();
-    this._mod = window.espeak;           // // global vom Loader
-    await this._mod.initialize({
+    if (this._loaded) return;
+
+    // 1) espeak.js klassisch laden (stellt window.espeak bereit)
+    if (!window.espeak) {
+      await this._loadScript('./tts/espeak.js'); // <-- Pfad prüfen (Gross/Kleinschreibung!)
+    }
+    if (!window.espeak?.initialize) {
+      throw new Error('espeak.js geladen, aber window.espeak.initialize fehlt');
+    }
+
+    // 2) espeak initialisieren (Pfad zu .wasm/.worker/.data)
+    await window.espeak.initialize({
       wasmPath: './tts/espeak.wasm',
       workerPath: './tts/espeak.worker.js',
       dataPath: './tts/espeak.data'
     });
-  }
 
-  async _ensureEspeakLoaded(){
-    if (window.espeak?.initialize) return;
-    await import('./tts/espeak.js');     // // dynamischer Import des Loaders
+    this._mod = window.espeak;
+    this._loaded = true;
   }
 
   // Text → WAV (Uint8Array)
   async synthWav(text){
-    if (!this._mod) throw new Error('TTS nicht geladen');
-    // eSpeak API: synthesize({text, voice, rate, pitch, sampleRate}) → Uint8Array (WAV)
+    if (!this._loaded) throw new Error('TTS nicht geladen');
     const wav = await this._mod.synthesize({
       text,
       voice: this.voice,
       rate: this.rate,
       pitch: this.pitch,
-      sampleRate: this.sampleRate,
-      // optional: flags/phonemes etc.
+      sampleRate: this.sampleRate
     });
     return wav; // Uint8Array (RIFF/WAV)
   }
@@ -55,12 +66,11 @@ export class TtsEngine {
   async synthBuffer(text){
     const wav = await this.synthWav(text);
     const buf = await this._ctx.decodeAudioData(wav.buffer.slice(0));
-    // Falls Samplerate ≠ Ziel, wird später beim Offline-Render noch resampled – ok.
     return buf;
   }
 
-  // Kleiner Dreiklang-Gong synthetisch als AudioBuffer (ohne Dateien)
-  makeGongBuffer(duration=1.6){
+  // Dreiklang-Gong synthetisch erzeugen (ohne Datei)
+  async makeGongBuffer(duration=1.6){
     const ctx = new OfflineAudioContext(1, Math.ceil(this.sampleRate*duration), this.sampleRate);
     const hit = (freq, t0, g1=0.6, g2=0.15, d1=1.2, d2=1.0) => {
       const osc1 = new OscillatorNode(ctx, {type:'sine', frequency:freq});
